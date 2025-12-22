@@ -48,6 +48,8 @@ if uploaded_file:
         processed_img = preprocess_image(img)
 
         prediction = model.predict(processed_img)[0][0]
+        st.caption(f"🔎 Raw model output: {prediction:.6f}")
+
 
     st.markdown("---")
 
