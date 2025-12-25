@@ -1,66 +1,154 @@
-import streamlit as st
-import tensorflow as tf
+# app.py
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.models import Response as OpenAPIResponse
+import uvicorn
 import numpy as np
+import io
 from PIL import Image
+import torch
+from torchvision import transforms
+from datetime import datetime
 
-# ---------------- CONFIG ----------------
-MODEL_PATH = "models/pneumonia_model.h5"
-IMG_SIZE = 224
-CONFIDENCE_THRESHOLD = 0.5
+# -----------------------------
+# Device detection
+# -----------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------- PAGE UI ----------------
-st.set_page_config(
-    page_title="AI Pneumonia Detection",
-    page_icon="🫁",
-    layout="centered"
+# -----------------------------
+# Load models
+# -----------------------------
+try:
+    arrhythmia_model = torch.load("arhythmia_model.pth", map_location=DEVICE)
+    arrhythmia_model.eval()
+except Exception as e:
+    raise RuntimeError(f"Failed to load Arrhythmia model: {str(e)}")
+
+try:
+    pneumonia_model = torch.load("pneumonia_model.pth", map_location=DEVICE)
+    pneumonia_model.eval()
+except Exception as e:
+    raise RuntimeError(f"Failed to load Pneumonia model: {str(e)}")
+
+# -----------------------------
+# FastAPI App Initialization
+# -----------------------------
+app = FastAPI(
+    title="Health AI Diagnostic API",
+    description="Unified API for Arrhythmia and Pneumonia prediction with confidence scores and combined predictions",
+    version="1.1.0"
 )
 
-st.title("🫁 AI Pneumonia Detection")
-st.caption("Chest X-ray based diagnostic support tool")
-st.markdown("---")
-
-# ---------------- LOAD MODEL ----------------
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model(MODEL_PATH)
-
-model = load_model()
-
-# ---------------- IMAGE PREPROCESS ----------------
-def preprocess_image(image: Image.Image):
-    image = image.convert("RGB")          # ✅ FIXED (3 channels)
-    image = image.resize((IMG_SIZE, IMG_SIZE))
-    image = np.array(image) / 255.0
-    image = np.expand_dims(image, axis=0) # (1,224,224,3)
-    return image
-
-# ---------------- UI INPUT ----------------
-uploaded_file = st.file_uploader(
-    "📤 Upload Chest X-ray Image",
-    type=["jpg", "jpeg", "png"]
+# CORS middleware for frontend apps
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-if uploaded_file:
-    st.image(uploaded_file, caption="Uploaded X-ray", use_column_width=True)
+# -----------------------------
+# Utility Functions
+# -----------------------------
+def predict_arrhythmia(signal: np.ndarray):
+    """Predict Arrhythmia from 1D ECG signal"""
+    if signal.ndim != 1:
+        raise ValueError("ECG signal must be a 1D array")
+    input_tensor = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        output = arrhythmia_model(input_tensor)
+        probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
+        prediction_class = int(np.argmax(probabilities))
+    return {"prediction": prediction_class, "confidence": float(probabilities[prediction_class])}
 
-    with st.spinner("🧠 Analyzing image..."):
-        img = Image.open(uploaded_file)
-        processed_img = preprocess_image(img)
+def predict_pneumonia(image_bytes: bytes):
+    """Predict Pneumonia from X-ray image"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise ValueError("Invalid image file")
 
-        prediction = model.predict(processed_img)[0][0]
-        st.caption(f"🔎 Raw model output: {prediction:.6f}")
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+    input_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        output = pneumonia_model(input_tensor)
+        probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
+        prediction_class = int(np.argmax(probabilities))
+    return {"prediction": prediction_class, "confidence": float(probabilities[prediction_class])}
 
+# -----------------------------
+# API Endpoints
+# -----------------------------
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to Health AI Diagnostic API. Use /predict for combined predictions or individual endpoints."
+    }
 
-    st.markdown("---")
+@app.post("/predict")
+async def predict_endpoint(
+    ecg_file: UploadFile = File(..., description="Upload ECG CSV file for Arrhythmia prediction"),
+    xray_file: UploadFile = File(..., description="Upload X-ray image file for Pneumonia prediction")
+):
+    """
+    Unified prediction endpoint for both Arrhythmia and Pneumonia
+    """
+    try:
+        # Process ECG
+        ecg_content = await ecg_file.read()
+        ecg_signal = np.loadtxt(io.BytesIO(ecg_content), delimiter=",")
+        arrhythmia_result = predict_arrhythmia(ecg_signal)
 
-    confidence = prediction if prediction > CONFIDENCE_THRESHOLD else 1 - prediction
-    confidence = round(confidence * 100, 2)
+        # Process X-ray
+        xray_content = await xray_file.read()
+        pneumonia_result = predict_pneumonia(xray_content)
 
-    if prediction > CONFIDENCE_THRESHOLD:
-        st.error(f"🚨 **Pneumonia Detected**\n\nConfidence: **{confidence}%**")
-    else:
-        st.success(f"✅ **Normal Chest X-ray**\n\nConfidence: **{confidence}%**")
+        # Combined response
+        response = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "device": str(DEVICE),
+            "models": {
+                "arrhythmia_model": "v1.0",
+                "pneumonia_model": "v1.0"
+            },
+            "results": {
+                "arrhythmia": arrhythmia_result,
+                "pneumonia": pneumonia_result
+            }
+        }
+        return JSONResponse(content=response)
 
-    st.info(
-        "⚠️ **Disclaimer:** This tool is for educational purposes only and is not a medical diagnosis."
-    )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/predict/arhythmia")
+async def predict_arrhythmia_endpoint(signal_file: UploadFile = File(...)):
+    try:
+        content = await signal_file.read()
+        signal = np.loadtxt(io.BytesIO(content), delimiter=",")
+        result = predict_arrhythmia(signal)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Arrhythmia prediction failed: {str(e)}")
+
+@app.post("/predict/pneumonia")
+async def predict_pneumonia_endpoint(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        result = predict_pneumonia(image_bytes)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Pneumonia prediction failed: {str(e)}")
+
+# -----------------------------
+# Run the app
+# -----------------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
