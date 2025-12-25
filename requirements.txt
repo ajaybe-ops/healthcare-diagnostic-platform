@@ -1,4 +1,23 @@
-tensorflow
+# Core App
 streamlit
+
+# Deep Learning
+tensorflow
+
+# Data Handling
 numpy
+pandas
+
+# Machine Learning
+scikit-learn
+
+# Image Processing (Pneumonia)
 pillow
+opencv-python
+
+# Visualization
+matplotlib
+seaborn
+
+# Explainability (Arrhythmia)
+shap
