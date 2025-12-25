@@ -1,154 +1,71 @@
-# app.py
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.models import Response as OpenAPIResponse
-import uvicorn
+import os
+import sys
+import json
 import numpy as np
-import io
-from PIL import Image
+
+# TensorFlow / Keras
+import tensorflow as tf
+
+# PyTorch
 import torch
-from torchvision import transforms
-from datetime import datetime
 
-# -----------------------------
-# Device detection
-# -----------------------------
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ====== SETTINGS ======
+BASE_DIR = "C:/Users/Lab/OneDrive/Desktop/Arrhythmia model/processed/"
 
-# -----------------------------
-# Load models
-# -----------------------------
-try:
-    arrhythmia_model = torch.load("arhythmia_model.pth", map_location=DEVICE)
-    arrhythmia_model.eval()
-except Exception as e:
-    raise RuntimeError(f"Failed to load Arrhythmia model: {str(e)}")
+# Arrhythmia (TensorFlow)
+ARRHYTHMIA_WEIGHTS = os.path.join(BASE_DIR, "baseline_cnn_weights.h5")
+INPUT_SHAPE = (360, 1)
+NUM_CLASSES_ARRHYTHMIA = 5  # Replace with your actual number
 
-try:
-    pneumonia_model = torch.load("pneumonia_model.pth", map_location=DEVICE)
-    pneumonia_model.eval()
-except Exception as e:
-    raise RuntimeError(f"Failed to load Pneumonia model: {str(e)}")
+# Pneumonia (PyTorch)
+PNEUMONIA_MODEL_PATH = os.path.join(BASE_DIR, "pneumonia_model.pth")
+NUM_CLASSES_PNEUMONIA = 2  # Replace with your actual number
 
-# -----------------------------
-# FastAPI App Initialization
-# -----------------------------
-app = FastAPI(
-    title="Health AI Diagnostic API",
-    description="Unified API for Arrhythmia and Pneumonia prediction with confidence scores and combined predictions",
-    version="1.1.0"
-)
+# ====== 1. Build Arrhythmia CNN ======
+def build_arrhythmia_cnn(input_shape, num_classes):
+    inputs = tf.keras.Input(shape=input_shape)
+    x = tf.keras.layers.Conv1D(32, 7, padding='same', activation='relu')(inputs)
+    x = tf.keras.layers.Conv1D(64, 5, padding='same', activation='relu')(x)
+    x = tf.keras.layers.Conv1D(64, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.GlobalMaxPooling1D()(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
+    return tf.keras.Model(inputs, outputs)
 
-# CORS middleware for frontend apps
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Load Arrhythmia model
+arrhythmia_model = build_arrhythmia_cnn(INPUT_SHAPE, NUM_CLASSES_ARRHYTHMIA)
+arrhythmia_model.load_weights(ARRHYTHMIA_WEIGHTS)
+print("✅ Arrhythmia model loaded successfully!")
 
-# -----------------------------
-# Utility Functions
-# -----------------------------
-def predict_arrhythmia(signal: np.ndarray):
-    """Predict Arrhythmia from 1D ECG signal"""
-    if signal.ndim != 1:
-        raise ValueError("ECG signal must be a 1D array")
-    input_tensor = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+# ====== 2. Load Pneumonia PyTorch Model ======
+# Define your pneumonia model architecture here
+class PneumoniaCNN(torch.nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(1, 16, 3, padding=1)
+        self.conv2 = torch.nn.Conv2d(16, 32, 3, padding=1)
+        self.pool = torch.nn.MaxPool2d(2, 2)
+        self.fc = torch.nn.Linear(32*64*64, num_classes)  # adjust for your input size
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+pneumonia_model = PneumoniaCNN(NUM_CLASSES_PNEUMONIA)
+pneumonia_model.load_state_dict(torch.load(PNEUMONIA_MODEL_PATH, map_location=torch.device('cpu')))
+pneumonia_model.eval()
+print("✅ Pneumonia model loaded successfully!")
+
+# ====== 3. Example inference ======
+def predict_arrhythmia(sample):
+    sample = sample.astype(np.float32)[..., np.newaxis]
+    pred = arrhythmia_model.predict(np.array([sample]))
+    return np.argmax(pred, axis=1)[0]
+
+def predict_pneumonia(sample):
+    sample = torch.tensor(sample, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # adjust dims
     with torch.no_grad():
-        output = arrhythmia_model(input_tensor)
-        probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
-        prediction_class = int(np.argmax(probabilities))
-    return {"prediction": prediction_class, "confidence": float(probabilities[prediction_class])}
-
-def predict_pneumonia(image_bytes: bytes):
-    """Predict Pneumonia from X-ray image"""
-    try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        raise ValueError("Invalid image file")
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
-    ])
-    input_tensor = transform(image).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        output = pneumonia_model(input_tensor)
-        probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
-        prediction_class = int(np.argmax(probabilities))
-    return {"prediction": prediction_class, "confidence": float(probabilities[prediction_class])}
-
-# -----------------------------
-# API Endpoints
-# -----------------------------
-@app.get("/")
-async def root():
-    return {
-        "message": "Welcome to Health AI Diagnostic API. Use /predict for combined predictions or individual endpoints."
-    }
-
-@app.post("/predict")
-async def predict_endpoint(
-    ecg_file: UploadFile = File(..., description="Upload ECG CSV file for Arrhythmia prediction"),
-    xray_file: UploadFile = File(..., description="Upload X-ray image file for Pneumonia prediction")
-):
-    """
-    Unified prediction endpoint for both Arrhythmia and Pneumonia
-    """
-    try:
-        # Process ECG
-        ecg_content = await ecg_file.read()
-        ecg_signal = np.loadtxt(io.BytesIO(ecg_content), delimiter=",")
-        arrhythmia_result = predict_arrhythmia(ecg_signal)
-
-        # Process X-ray
-        xray_content = await xray_file.read()
-        pneumonia_result = predict_pneumonia(xray_content)
-
-        # Combined response
-        response = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "device": str(DEVICE),
-            "models": {
-                "arrhythmia_model": "v1.0",
-                "pneumonia_model": "v1.0"
-            },
-            "results": {
-                "arrhythmia": arrhythmia_result,
-                "pneumonia": pneumonia_result
-            }
-        }
-        return JSONResponse(content=response)
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
-
-@app.post("/predict/arhythmia")
-async def predict_arrhythmia_endpoint(signal_file: UploadFile = File(...)):
-    try:
-        content = await signal_file.read()
-        signal = np.loadtxt(io.BytesIO(content), delimiter=",")
-        result = predict_arrhythmia(signal)
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Arrhythmia prediction failed: {str(e)}")
-
-@app.post("/predict/pneumonia")
-async def predict_pneumonia_endpoint(file: UploadFile = File(...)):
-    try:
-        image_bytes = await file.read()
-        result = predict_pneumonia(image_bytes)
-        return JSONResponse(content=result)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Pneumonia prediction failed: {str(e)}")
-
-# -----------------------------
-# Run the app
-# -----------------------------
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        logits = pneumonia_model(sample)
+        pred = torch.argmax(logits, dim=1)
+    return pred.item()
