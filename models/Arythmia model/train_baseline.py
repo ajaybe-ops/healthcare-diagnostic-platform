@@ -9,10 +9,10 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 
 # =========== SETTINGS ===========
 DATA_DIR = Path("C:/Users/Lab/OneDrive/Desktop/Arythmia model/processed/")
-SCHEMA_PATH = DATA_DIR / "dataset_schema.json"
 WEIGHTS_PATH = DATA_DIR / "baseline_cnn_weights.h5"
 METRICS_PATH = DATA_DIR / "baseline_cnn_metrics.json"
 LOGS_PATH = DATA_DIR / "baseline_cnn_train.log"
+
 INPUT_SHAPE = (360, 1)
 EPOCHS = 12
 BATCH_SIZE = 64
@@ -22,11 +22,7 @@ def abort(msg):
     print(f"CRITICAL ERROR: {msg}")
     sys.exit(1)
 
-# =========== 1. SCHEMA ENFORCEMENT AT STARTUP ===========
-import schema
-schema.validate_schema(DATA_DIR)
-
-# =========== 2. LOAD SPLITS ===========
+# =========== 1. LOAD SPLITS ===========
 def load_split(indices_file):
     idx = np.load(DATA_DIR / indices_file)
     return idx
@@ -37,7 +33,7 @@ train_idx = load_split("train_idx.npy")
 val_idx = load_split("val_idx.npy")
 test_idx = load_split("test_idx.npy")
 
-# Subset data according to splits (do not copy all to memory except as needed)
+# Subset data according to splits
 X_train = X[train_idx]
 y_train = y[train_idx]
 X_val = X[val_idx]
@@ -45,7 +41,7 @@ y_val = y[val_idx]
 X_test = X[test_idx]
 y_test = y[test_idx]
 
-# =========== 3. DATA PREP ===========
+# =========== 2. DATA PREP ===========
 # Ensure channels-last and float32
 def to_model_input(arr):
     if arr.ndim == 2:
@@ -58,11 +54,11 @@ X_test = to_model_input(X_test)
 
 num_classes = len(np.unique(y))
 
-# =========== 4. CLASS WEIGHTS ===========
+# =========== 3. CLASS WEIGHTS ===========
 class_weights = compute_class_weight('balanced', classes=np.arange(num_classes), y=y_train)
 class_weights_dict = {i: w for i, w in enumerate(class_weights)}
 
-# =========== 5. MODEL DEFINITION ===========
+# =========== 4. MODEL DEFINITION ===========
 def build_cnn(input_shape, num_classes):
     inputs = tf.keras.Input(shape=input_shape)
     x = tf.keras.layers.Conv1D(32, 7, padding='same', activation='relu')(inputs)
@@ -79,7 +75,7 @@ model.compile(
     metrics=['accuracy']
 )
 
-# ============ 6. TRAIN ============
+# =========== 5. TRAIN ===========
 callback = tf.keras.callbacks.CSVLogger(str(LOGS_PATH))
 history = model.fit(
     X_train, y_train,
@@ -90,20 +86,25 @@ history = model.fit(
     callbacks=[callback],
     verbose=2
 )
+
 model.save_weights(WEIGHTS_PATH)
 
-# =========== 7. EVALUATE ===========
+# =========== 6. EVALUATE ===========
 def eval_and_report(X, y, split_name):
     y_pred = np.argmax(model.predict(X, batch_size=BATCH_SIZE), axis=1)
     acc = accuracy_score(y, y_pred)
-    prec, rec, f1, sup = precision_recall_fscore_support(y, y_pred, average=None, labels=range(num_classes), zero_division=0)
+    prec, rec, f1, sup = precision_recall_fscore_support(
+        y, y_pred, average=None, labels=range(num_classes), zero_division=0
+    )
     cm = confusion_matrix(y, y_pred, labels=range(num_classes))
+    
     print(f"\n===== {split_name.upper()} METRICS =====")
     print(f"Accuracy: {acc:.4f}")
     print("Per-class:")
     for i in range(num_classes):
         print(f"  Class {i}: Precision={prec[i]:.4f} Recall={rec[i]:.4f} F1={f1[i]:.4f} Support={sup[i]}")
     print(f"Confusion matrix:\n{cm}")
+    
     return {
         'split': split_name,
         'accuracy': float(acc),
@@ -124,4 +125,3 @@ with open(METRICS_PATH, 'w') as f:
 print(f"\nSaved model weights to {WEIGHTS_PATH}")
 print(f"Saved metrics JSON to {METRICS_PATH}")
 print(f"Saved training logs to {LOGS_PATH}")
-
